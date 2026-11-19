@@ -389,6 +389,7 @@ methods (`Allow: GET` header set).
 | `HEALTH_HOST` | `127.0.0.1` | Bind address for the health server |
 | `HEALTH_PORT` | `8787` (or `PORT` if set by platform) | TCP port; `0` disables the listener |
 | `HEALTH_STALE_MS` | `90000` | `/health` returns 503 if no successful poll within this window |
+| `HEALTH_AUTH_TOKEN` | _(unset — auth disabled)_ | Bearer token required for every health-server route; headers over 4096 UTF-8 bytes get the same empty 401 as malformed values |
 | `METRICS_PORT` | _(unset — disabled)_ | TCP port for the separate metrics server; omit to disable |
 
 See [configuration-reference.md](configuration-reference.md) for all

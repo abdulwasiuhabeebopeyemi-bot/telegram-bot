@@ -304,7 +304,7 @@ export interface BotConfig extends StellarConfig {
    * an https URL at load time.
    */
   mimirAppUrl: string | null;
-  /** Optional bearer token for health endpoint authentication. Null disables auth. */
+  /** Optional bearer token for health endpoint authentication. Null disables auth. The server rejects Authorization headers over 4096 UTF-8 bytes before comparison. */
   healthAuthToken: string | null;
 }
 

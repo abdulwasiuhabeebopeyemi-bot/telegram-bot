@@ -164,6 +164,12 @@ export interface HealthReport {
 
 const CURSOR_PREVIEW_LEN = 24;
 
+/**
+ * Maximum UTF-8 byte length of an Authorization header accepted by the health
+ * server, including the `Bearer ` scheme prefix. Longer values are malformed.
+ */
+export const MAX_AUTH_HEADER_BYTES = 4096;
+
 function iso(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString();
 }
@@ -180,6 +186,8 @@ function constantTimeEquals(a: string, b: string): boolean {
 /**
  * Extract and validate the bearer token from the Authorization header.
  * Returns true if the token matches the expected value (or if auth is disabled).
+ * The header's UTF-8 byte length is bounded before parsing or comparison, so
+ * oversized values take the same unauthorised path as other malformed headers.
  */
 function isValidAuth(
   authHeader: string | undefined,
@@ -189,6 +197,7 @@ function isValidAuth(
   // the server is loopback-only, which config validation enforces.
   if (expectedToken === null || expectedToken === undefined) return true;
   if (authHeader === undefined) return false;
+  if (Buffer.byteLength(authHeader, "utf8") > MAX_AUTH_HEADER_BYTES) return false;
 
   const match = authHeader.match(/^Bearer\s+(.+)$/i);
   if (!match || match[1] === undefined) return false;

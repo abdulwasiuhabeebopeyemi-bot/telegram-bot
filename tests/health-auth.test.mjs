@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { startHealthServer } from "../dist/health.js";
+import { MAX_AUTH_HEADER_BYTES, startHealthServer } from "../dist/health.js";
 
 // Built from parts so the secret scanner (scripts/scan-secrets.mjs) does not
 // flag this test fixture as a leaked bearer token.
@@ -27,6 +27,14 @@ function baseConfig(overrides = {}) {
     healthAuthToken: null,
     ...overrides,
   };
+}
+
+async function assertBoundedUnauthorized(res) {
+  assert.equal(res.status, 401);
+  assert.equal(res.headers.get("content-type"), "application/json; charset=utf-8");
+  assert.equal(res.headers.get("cache-control"), "no-store");
+  assert.equal(res.headers.get("content-length"), "0");
+  assert.equal(await res.text(), "");
 }
 
 function baseStatus(overrides = {}) {
@@ -113,6 +121,12 @@ test("health endpoint accessible without authentication when HEALTH_AUTH_TOKEN i
     assert.equal(res.status, 200);
     const body = await res.json();
     assert.equal(body.ok, true);
+
+    // An oversized header is ignored when no token is configured.
+    const resOversized = await fetch(`${server.url}/health`, {
+      headers: { Authorization: `Bearer ${"a".repeat(MAX_AUTH_HEADER_BYTES)}` },
+    });
+    assert.equal(resOversized.status, 200);
   } finally {
     await server.close();
   }
@@ -256,6 +270,59 @@ test("malformed Authorization header returns 401", async () => {
       headers: { Authorization: "Bearer " },
     });
     assert.equal(resEmpty.status, 401);
+  } finally {
+    await server.close();
+  }
+});
+
+test("oversized Authorization headers get the same bounded 401", async () => {
+  const oversizedToken = "a".repeat(MAX_AUTH_HEADER_BYTES);
+  const config = baseConfig({
+    healthPort: 18795,
+    healthAuthToken: oversizedToken,
+  });
+  const server = startHealthServer({
+    config,
+    status: () => baseStatus(),
+    now: () => 5_500,
+  });
+  assert.ok(server.url);
+
+  try {
+    const resMatching = await fetch(`${server.url}/health`, {
+      headers: { Authorization: `Bearer ${oversizedToken}` },
+    });
+    await assertBoundedUnauthorized(resMatching);
+
+    const resMalformed = await fetch(`${server.url}/health`, {
+      headers: { Authorization: "x".repeat(MAX_AUTH_HEADER_BYTES + 1) },
+    });
+    await assertBoundedUnauthorized(resMalformed);
+  } finally {
+    await server.close();
+  }
+});
+
+test("Authorization header at the fixed byte limit is accepted", async () => {
+  const token = "a".repeat(MAX_AUTH_HEADER_BYTES - Buffer.byteLength("Bearer "));
+  assert.equal(Buffer.byteLength(`Bearer ${token}`), MAX_AUTH_HEADER_BYTES);
+  const config = baseConfig({
+    healthPort: 18796,
+    healthAuthToken: token,
+  });
+  const server = startHealthServer({
+    config,
+    status: () => baseStatus(),
+    now: () => 5_500,
+  });
+  assert.ok(server.url);
+
+  try {
+    const res = await fetch(`${server.url}/health`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    assert.equal(res.status, 200);
+    assert.equal((await res.json()).ok, true);
   } finally {
     await server.close();
   }

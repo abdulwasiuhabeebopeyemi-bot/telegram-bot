@@ -1097,6 +1097,7 @@ Configuration (see `.env.example`):
 - `HEALTH_HOST` — bind address (default `127.0.0.1`; set to `0.0.0.0` for Docker)
 - `HEALTH_PORT` — TCP port (default `8787`; `0` disables)
 - `HEALTH_STALE_MS` — degraded if no successful poll within this window after the first success (default `90000`; `0` disables)
+- `HEALTH_AUTH_TOKEN` — optional bearer token for all health/metrics routes; an Authorization header over 4096 UTF-8 bytes (including `Bearer `) is rejected with the same empty `401` as any malformed value
 - A stale cursor rejection independently makes `GET /health` return `503` until its target scans successfully; `HEALTH_STALE_MS` does not disable this cursor alert.
 - `STARTUP_HEALTH_DEADLINE_MS` — wall-clock budget for retrying the boot RPC `getHealth()` probe (default `30000`; `0` = single attempt)
 - `STARTUP_HEALTH_RETRY_MS` — delay between failed boot RPC health attempts (default `1000`)
