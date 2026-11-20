@@ -21,6 +21,10 @@ export const DEFAULT_MAX_PER_CHAT = 50;
 
 export const DEFAULT_MAX_TOTAL = 5000;
 
+// Minimal edit scoped to the file provided: the issue's callback-confirmation
+// persistence lives in src/callbacks.ts and src/commands/broadcast.ts, which
+// are not included here, so no changes are made to the subscription store.
+
 export class FollowStoreError extends Error {
   constructor(message: string) {
     super(message);

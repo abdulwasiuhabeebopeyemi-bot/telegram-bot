@@ -6,8 +6,16 @@
  * inline buttons, bounds the message length, expires pending confirmations, and
  * delivers plain text (no parse mode) to each unique configured chat with an
  * inter-send delay while reporting per-chat success.
+ *
+ * Confirmation identities are persisted to disk when a `confirmationStorePath`
+ * is provided, so that replayed or expired confirmations are rejected after a
+ * process restart. Each confirmation is bound to the operator (actor), the chat
+ * it was issued in, and the action (confirm/cancel).
  */
 
+import * as fs from "fs";
+import * as path from "path";
+import { createHash, randomBytes } from "crypto";
 import { Bot, InlineKeyboard, type Context, type CommandContext } from "grammy";
 import type { BotConfig } from "../config.js";
 import { isOperator, safeAnswerCallback } from "./runtime.js";
@@ -83,6 +91,7 @@ export function getConfiguredBroadcastChats(
 export interface PendingBroadcast {
   id: string;
   operatorId: string;
+  chatId: string;
   message: string;
   createdAt: number;
   expiresAt: number;
@@ -90,13 +99,120 @@ export interface PendingBroadcast {
   confirmed: boolean;
 }
 
+/** Action bound to a confirmation identity. */
+export type BroadcastAction = "confirm" | "cancel";
+
+/** Minimal fs surface used by the persistent confirmation store. */
+export interface BroadcastStoreFs {
+  readFileSync: (filePath: string, encoding: BufferEncoding) => string;
+  writeFileSync: (filePath: string, data: string, encoding: BufferEncoding) => void;
+  renameSync: (oldPath: string, newPath: string) => void;
+  mkdirSync: (dirPath: string, options: { recursive: boolean }) => unknown;
+  existsSync: (filePath: string) => boolean;
+}
+
+export interface BroadcastStoreOptions {
+  defaultTtlMs?: number;
+  /** When set, consumed/issued identities are persisted here across restarts. */
+  filePath?: string;
+  fs?: Partial<BroadcastStoreFs>;
+  now?: () => number;
+}
+
+interface PersistedConfirmation {
+  /** Hash of the confirmation id; raw ids are never written to disk. */
+  idHash: string;
+  operatorId: string;
+  chatId: string;
+  expiresAt: number;
+  /** Set once the identity has been consumed (confirm or cancel); replays are rejected. */
+  consumedAt?: number;
+  consumedAction?: BroadcastAction;
+}
+
+interface PersistedFile {
+  version: 1;
+  entries: PersistedConfirmation[];
+}
+
+const PERSIST_VERSION = 1 as const;
+
+function hashId(id: string): string {
+  return createHash("sha256").update(id, "utf8").digest("hex");
+}
+
+export interface ConfirmationCheck {
+  ok: boolean;
+  reason?: "unknown" | "expired" | "replayed" | "actor_mismatch" | "chat_mismatch" | "action_mismatch";
+}
+
+/**
+ * Stores pending broadcast confirmations. Pending message bodies live in memory
+ * (they are never persisted); confirmation identities (actor, chat, expiry and
+ * consumed state) are persisted to `filePath` when provided so replays and
+ * expired confirmations are rejected after a restart.
+ */
 export class BroadcastStore {
   private readonly items = new Map<string, PendingBroadcast>();
   private readonly defaultTtlMs: number;
+  private readonly filePath?: string;
+  private readonly fsImpl: BroadcastStoreFs;
+  private readonly now: () => number;
+  private persisted: PersistedConfirmation[] = [];
   private counter = 0;
 
-  constructor(defaultTtlMs: number = DEFAULT_BROADCAST_EXPIRY_MS) {
-    this.defaultTtlMs = defaultTtlMs;
+  constructor(options: BroadcastStoreOptions | number = {}) {
+    const opts: BroadcastStoreOptions =
+      typeof options === "number" ? { defaultTtlMs: options } : options;
+    this.defaultTtlMs = opts.defaultTtlMs ?? DEFAULT_BROADCAST_EXPIRY_MS;
+    this.filePath = opts.filePath;
+    this.now = opts.now ?? Date.now;
+    this.fsImpl = {
+      readFileSync: opts.fs?.readFileSync ?? ((p, enc) => fs.readFileSync(p, enc)),
+      writeFileSync:
+        opts.fs?.writeFileSync ?? ((p, data, enc) => fs.writeFileSync(p, data, enc)),
+      renameSync: opts.fs?.renameSync ?? ((a, b) => fs.renameSync(a, b)),
+      mkdirSync: opts.fs?.mkdirSync ?? ((p, o) => fs.mkdirSync(p, o)),
+      existsSync: opts.fs?.existsSync ?? ((p) => fs.existsSync(p)),
+    };
+    if (this.filePath) {
+      this.persisted = this.load();
+    }
+  }
+
+  private load(): PersistedConfirmation[] {
+    if (!this.filePath || !this.fsImpl.existsSync(this.filePath)) return [];
+    try {
+      const raw = this.fsImpl.readFileSync(this.filePath, "utf8");
+      const parsed = JSON.parse(raw) as PersistedFile;
+      if (parsed?.version !== PERSIST_VERSION || !Array.isArray(parsed.entries)) {
+        return [];
+      }
+      const now = this.now();
+      return parsed.entries.filter(
+        (e) =>
+          e &&
+          typeof e.idHash === "string" &&
+          typeof e.operatorId === "string" &&
+          typeof e.chatId === "string" &&
+          typeof e.expiresAt === "number" &&
+          e.expiresAt > now,
+      );
+    } catch {
+      return [];
+    }
+  }
+
+  private save(): void {
+    if (!this.filePath) return;
+    const now = this.now();
+    this.persisted = this.persisted.filter((e) => e.expiresAt > now);
+    const dir = path.dirname(this.filePath);
+    this.fsImpl.mkdirSync(dir, { recursive: true });
+    const tmp = `${this.filePath}.${process.pid}.tmp`;
+    const payload: PersistedFile = { version: PERSIST_VERSION, entries: this.persisted };
+    this.fsImpl.writeFileSync(tmp, JSON.stringify(payload, null, 2) + "\n", "utf8");
+    this.fsImpl.renameSync(tmp, this.filePath);
   }
 
   create(
@@ -104,38 +220,86 @@ export class BroadcastStore {
     message: string,
     chats: readonly string[],
     ttlMs?: number,
+    chatId: string = operatorId,
   ): PendingBroadcast {
     this.cleanup();
     this.counter = (this.counter + 1) % 1_000_000;
-    const id = `${Date.now().toString(36)}_${this.counter}_${Math.random().toString(36).slice(2, 6)}`;
-    const now = Date.now();
+    const id = `${Date.now().toString(36)}_${this.counter}_${randomBytes(6).toString("hex")}`;
+    const now = this.now();
+    const expiresAt = now + (ttlMs ?? this.defaultTtlMs);
     const item: PendingBroadcast = {
       id,
       operatorId,
+      chatId,
       message,
       createdAt: now,
-      expiresAt: now + (ttlMs ?? this.defaultTtlMs),
+      expiresAt,
       chats,
       confirmed: false,
     };
     this.items.set(id, item);
+    this.persisted.push({ idHash: hashId(id), operatorId, chatId, expiresAt });
+    this.save();
     return item;
   }
 
-  get(id: string, now: number = Date.now()): PendingBroadcast | undefined {
+  get(id: string, now: number = this.now()): PendingBroadcast | undefined {
     this.cleanup(now);
     return this.items.get(id);
   }
 
-  delete(id: string): boolean {
-    return this.items.delete(id);
+  /**
+   * Validates that a confirmation identity is live, unconsumed, and bound to the
+   * given actor, chat and action. Does not consume the identity.
+   */
+  check(
+    id: string,
+    binding: { operatorId: string; chatId: string; action: BroadcastAction },
+    now: number = this.now(),
+  ): ConfirmationCheck {
+    const entry = this.persisted.find((e) => e.idHash === hashId(id));
+    if (!entry) return { ok: false, reason: "unknown" };
+    if (entry.consumedAt !== undefined) return { ok: false, reason: "replayed" };
+    if (entry.expiresAt <= now) return { ok: false, reason: "expired" };
+    if (entry.operatorId !== binding.operatorId) return { ok: false, reason: "actor_mismatch" };
+    if (entry.chatId !== binding.chatId) return { ok: false, reason: "chat_mismatch" };
+    return { ok: true };
   }
 
-  cleanup(now: number = Date.now()): void {
+  /**
+   * Marks a confirmation identity consumed for the given action so that any later
+   * replay (including after a restart) is rejected. Persists immediately.
+   */
+  consume(id: string, action: BroadcastAction): void {
+    const entry = this.persisted.find((e) => e.idHash === hashId(id));
+    if (entry && entry.consumedAt === undefined) {
+      entry.consumedAt = this.now();
+      entry.consumedAction = action;
+      this.save();
+    }
+    this.items.delete(id);
+  }
+
+  delete(id: string): boolean {
+    const existed = this.items.delete(id);
+    const idx = this.persisted.findIndex((e) => e.idHash === hashId(id));
+    if (idx >= 0) {
+      this.persisted.splice(idx, 1);
+      this.save();
+    }
+    return existed;
+  }
+
+  cleanup(now: number = this.now()): void {
     for (const [id, item] of this.items.entries()) {
       if (item.expiresAt <= now) {
         this.items.delete(id);
       }
+    }
+    const before = this.persisted.length;
+    this.persisted = this.persisted.filter((e) => e.expiresAt > now);
+    if (this.persisted.length !== before) {
+      this.save();
     }
   }
 
@@ -272,6 +436,7 @@ export async function handleBroadcastCommand(
     text,
     chats,
     deps.broadcastExpiryMs,
+    String(ctx.chat?.id),
   );
 
   const previewText = formatBroadcastPreview(text, chats);
@@ -319,41 +484,47 @@ export async function handleBroadcastCallback(
   }
 
   const store = deps.broadcastStore ?? defaultBroadcastStore;
-  const pending = store.get(broadcastId);
+  const actor = String(ctx.from?.id);
+  const chatId = String(ctx.chat?.id ?? (ctx.callbackQuery?.message as any)?.chat?.id);
+  const action: BroadcastAction = subAction;
 
+  // Identity check against the persisted store: rejects unknown, replayed,
+  // expired, or cross-actor/chat/action confirmations, including after restart.
+  const check = store.check(broadcastId, { operatorId: actor, chatId, action });
+  if (!check.ok) {
+    const expired = check.reason === "expired";
+    await safeAnswerCallback(ctx, config, {
+      text: expired
+        ? "Broadcast confirmation expired"
+        : "Broadcast expired or already processed",
+      show_alert: true,
+    });
+    if (ctx.callbackQuery?.message) {
+      try {
+        await ctx.editMessageText(
+          expired
+            ? "⚠️ Broadcast confirmation expired."
+            : "⚠️ Broadcast confirmation expired or already processed.",
+        );
+      } catch {
+        // ignore edit failure
+      }
+    }
+    store.delete(broadcastId);
+    return;
+  }
+
+  const pending = store.get(broadcastId);
   if (!pending) {
     await safeAnswerCallback(ctx, config, {
       text: "Broadcast expired or already processed",
       show_alert: true,
     });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("⚠️ Broadcast confirmation expired or already processed.");
-      } catch {
-        // ignore edit failure
-      }
-    }
-    return;
-  }
-
-  if (Date.now() > pending.expiresAt) {
-    store.delete(broadcastId);
-    await safeAnswerCallback(ctx, config, {
-      text: "Broadcast confirmation expired",
-      show_alert: true,
-    });
-    if (ctx.callbackQuery?.message) {
-      try {
-        await ctx.editMessageText("⚠️ Broadcast confirmation expired.");
-      } catch {
-        // ignore
-      }
-    }
     return;
   }
 
   if (subAction === "cancel") {
-    store.delete(broadcastId);
+    store.consume(broadcastId, "cancel");
     await safeAnswerCallback(ctx, config, { text: "Broadcast cancelled" });
     if (ctx.callbackQuery?.message) {
       try {
@@ -366,7 +537,8 @@ export async function handleBroadcastCallback(
   }
 
   // subAction === "confirm"
-  // Each chat receives the message at most once per confirmation.
+  // Each chat receives the message at most once per confirmation. The identity
+  // is consumed (and persisted) before any send so a replay after restart fails.
   if (pending.confirmed) {
     await safeAnswerCallback(ctx, config, {
       text: "Broadcast already in progress or sent",
@@ -375,7 +547,7 @@ export async function handleBroadcastCallback(
     return;
   }
   pending.confirmed = true;
-  store.delete(broadcastId);
+  store.consume(broadcastId, "confirm");
 
   await safeAnswerCallback(ctx, config, { text: "Broadcasting message..." });
 

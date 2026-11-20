@@ -15,6 +15,7 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 - `BOT_TOKEN`: The API token for the Telegram bot. Required.
 - `TELEGRAM_CHAT_ID`: The numeric ID or `@channelusername` where notifications are posted. Required.
 - `MIMIR_LOCALE`: Language for bot replies and notifications. Supported: `en` (default) and `es`; region tags such as `es-MX` resolve to the base language. Any other value fails fast at startup. See [Translator Guide](translating.md).
+- `BROADCAST_CONFIRMATION_STORE_PATH`: Optional path to a JSON file where `/broadcast` confirmation identities (operator, chat, action, expiry, consumed state) are persisted. When set, confirmations that were already consumed or have expired are rejected after a process restart, so a replayed Confirm button cannot re-send a broadcast. Message bodies are never written to disk. Defaults to unset (in-memory only). Use a path on a persistent volume, e.g. `data/broadcast-confirmations.json`.
 
 ### Mimir Contract Settings
 - `MARKET_CONTRACT_ID`: The Mimir market Soroban contract address. Required. Must be a valid `C...` strkey.
@@ -51,6 +52,11 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Telegram Failures and Rate Limits
 - **Behavior**: If Telegram's API is unreachable or rate-limits the bot (HTTP 429), the `grammy` framework handles standard retry-after backoffs. If the dispatch completely fails, the bot logs the failure.
 - **Safeguard**: `MAX_NOTIFICATIONS_PER_CYCLE` prevents internal bursts from hitting Telegram's strict anti-spam rate limits.
+- **Delivery semantics**: Notification delivery is at-least-once in the presence of failures and is **not** exactly-once. Do not rely on delivery receipts as proof of a chain event having been announced.
+
+### Broadcast Confirmations
+- **Behavior**: `/broadcast` confirmations are bound to the issuing operator, the chat in which they were issued, and the action (confirm or cancel). Each identity is consumed on first use.
+- **Restarts**: When `BROADCAST_CONFIRMATION_STORE_PATH` is set, identities survive restarts. Replayed or expired confirmations are rejected after a restart. Without it, pending confirmations are lost on restart and are rejected as unknown.
 
 ### Cursor Management and Restarts
 - **Behavior**: The cursor (the last ingested event's ledger sequence and ID) is persisted to `CURSOR_FILE` after events are dispatched.
@@ -71,7 +77,9 @@ The `.env.example` file contains the base configuration. The bot uses strict env
 ### Assumptions
 - Node.js version 20+.
 - `CURSOR_FILE` exists on a persistent volume. If the deployment is ephemeral and restarts frequently, mounting a volume for `data/cursor.json` ensures the bot doesn't spam recent events on every restart.
+- If `/broadcast` confirmations must survive restarts, `BROADCAST_CONFIRMATION_STORE_PATH` must also point at a persistent volume.
 
 ### Rollback
 - Since the bot is read-only, rolling back to an older version requires no on-chain coordination or state migrations.
 - **Cursor Compatibility**: If a rollback happens, ensure the older version is compatible with the format in `CURSOR_FILE` (a JSON object with `ledger` and `id`). If incompatible, clear the cursor file for a cold start lookback.
+- **Broadcast Store Compatibility**: The confirmation file is versioned (`version: 1`). Rolling back to a version without this feature simply ignores the file; in-flight confirmations are then lost, which fails closed.
